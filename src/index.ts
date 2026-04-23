@@ -876,7 +876,7 @@ async function handle_delete(request: Request, bucket: R2Bucket): Promise<Respon
 
 	let resource = await bucket.head(resource_path);
 	if (resource === null) {
-		return new Response('Not Found', { status: 404 });
+		return new Response(null, { status: 204 });
 	}
 	if (resource.customMetadata?.resourcetype !== '<collection />') {
 		await bucket.delete(resource_path);
@@ -918,6 +918,9 @@ async function handle_mkcol(request: Request, bucket: R2Bucket): Promise<Respons
 	// Check if the resource already exists
 	let resource = await bucket.head(resource_path);
 	if (resource !== null) {
+		if (resource.customMetadata?.resourcetype === '<collection />') {
+			return new Response(null, { status: 200 });
+		}
 		return new Response('Method Not Allowed', { status: 405 });
 	}
 
