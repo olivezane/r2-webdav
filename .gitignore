@@ -170,3 +170,9 @@ dist
 
 .dev.vars
 .wrangler/
+
+# Local-only dev files (not part of the project's remote surface)
+
+.scratch/
+CLAUDE.md
+docs/
