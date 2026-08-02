@@ -4,9 +4,9 @@
 
 **Blocked by:** None — can start immediately
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] One predicate (e.g. `isCollection`) is the only place the collection marker is read; all 15 call sites route through it
-- [ ] The unused XML-tag-name validator is deleted
-- [ ] All identifiers use one naming convention (camelCase); no behavior change
-- [ ] Local WebDAV compliance suite (litmus) stays green
+- [x] One predicate (e.g. `isCollection`) is the only place the collection marker is read; all 15 call sites route through it
+- [x] The unused XML-tag-name validator is deleted
+- [x] All identifiers use one naming convention (camelCase); no behavior change
+- [x] Local WebDAV compliance suite (litmus) stays green

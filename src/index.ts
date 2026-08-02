@@ -28,8 +28,8 @@ import {
 	getLocks,
 	getRequestLockTokens,
 	isProtectedProperty,
-	LockDetails,
 	normalizeLockToken,
+	type LockDetails,
 	parseLockTimeout,
 	preserveLocks,
 	requireLockPermission,
@@ -38,7 +38,7 @@ import {
 	VALID_LOCK_DEPTHS,
 	writeLocks,
 } from './locks.ts';
-import { serveHead, serveObject } from './content.ts';
+import { serveObject } from './content.ts';
 
 export interface Env {
 	// Example binding to R2. Learn more at https://developers.cloudflare.com/workers/runtime-apis/r2/
@@ -432,12 +432,18 @@ async function handleGet(request: Request, bucket: R2Bucket): Promise<Response> 
 			headers: { 'Content-Type': 'text/html; charset=utf-8' },
 		});
 	} else {
-		return serveObject(bucket, request, resourcePath);
+		return serveObject(request, bucket, resourcePath);
 	}
 }
 
 async function handleHead(request: Request, bucket: R2Bucket): Promise<Response> {
-	return serveHead(bucket, request, makeResourcePath(request));
+	// HEAD mirrors GET — including the collection-listing branch — with the body discarded.
+	let response = await handleGet(request, bucket);
+	return new Response(null, {
+		status: response.status,
+		statusText: response.statusText,
+		headers: response.headers,
+	});
 }
 
 async function handlePut(request: Request, bucket: R2Bucket): Promise<Response> {

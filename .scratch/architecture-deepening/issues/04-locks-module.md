@@ -4,9 +4,9 @@
 
 **Blocked by:** 03 — Tree-walk module
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] All write handlers (PUT, COPY, MOVE, PROPPATCH, LOCK, UNLOCK) interact with locks only through the module's two methods
-- [ ] Lock metadata keys, legacy single-lock migration, and token normalization exist nowhere outside the module
-- [ ] Unit tests cover: PUT after LOCK preserves the lock, MOVE preserves locks on both source and destination, COPY strips them
-- [ ] Litmus locks suite stays green
+- [x] All write handlers (PUT, COPY, MOVE, PROPPATCH, LOCK, UNLOCK) interact with locks only through the module's two methods
+- [x] Lock metadata keys, legacy single-lock migration, and token normalization exist nowhere outside the module
+- [x] Unit tests cover: PUT after LOCK preserves the lock, MOVE preserves locks on both source and destination, COPY strips them
+- [x] Litmus locks suite stays green

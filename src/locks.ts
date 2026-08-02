@@ -3,12 +3,14 @@
  * Handlers never touch lock key names; they call preserveLocks/requireLockPermission.
  */
 
-import { COLLECTION_MARKER, listObjects } from './collection.ts';
+import { COLLECTION_MARKER, getParentPath, listObjects } from './collection.ts';
 import { escapeXml } from './xml.ts';
 
 export const DEFAULT_LOCK_TIMEOUT = 3600;
 export const MAX_LOCK_TIMEOUT = 365 * 24 * 60 * 60;
 export const VALID_LOCK_DEPTHS = ['0', 'infinity'] as const;
+
+const LOCK_RECORDS_METADATA_KEY = 'lock_records';
 
 export const LOCK_METADATA_KEYS = [
 	'lock_token',
@@ -18,10 +20,8 @@ export const LOCK_METADATA_KEYS = [
 	'lock_timeout',
 	'lock_expires_at',
 	'lock_root',
-	'lock_records',
+	LOCK_RECORDS_METADATA_KEY,
 ] as const;
-
-const LOCK_RECORDS_METADATA_KEY = 'lock_records';
 
 export type LockDetails = {
 	token: string;
@@ -239,7 +239,7 @@ export async function requireLockPermission(
 	let lockTokens = getRequestLockTokens(request);
 	let candidates: string[] = [];
 
-	for (let current = resourcePath; current !== ''; current = current.split('/').slice(0, -1).join('/')) {
+	for (let current = resourcePath; current !== ''; current = getParentPath(current)) {
 		candidates.push(current);
 	}
 
@@ -291,7 +291,7 @@ export async function findMatchingLock(
 	resourcePath: string,
 ): Promise<{ resource: R2Object; lockDetails: LockDetails } | null> {
 	let lockTokens = getRequestLockTokens(request);
-	for (let current = resourcePath; ; current = current.split('/').slice(0, -1).join('/')) {
+	for (let current = resourcePath; ; current = getParentPath(current)) {
 		let resource = await bucket.head(current);
 		let lockDetails = getLocks(resource?.customMetadata).find(
 			(lockDetail) =>

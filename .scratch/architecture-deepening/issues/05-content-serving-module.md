@@ -4,9 +4,9 @@
 
 **Blocked by:** 01 — Collection seam & dead-code cleanup, 02 — Local test seam
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] GET and HEAD call the module; no handler re-encodes range shapes into header math
-- [ ] Oversized suffix range has a defined, correct response (clamp or unsatisfiable), covered by a unit test
-- [ ] Regression tests exist for each of the three historical range/status fixes (200-vs-206 for non-Range GET, suffix-value handling, byte-range math)
-- [ ] Litmus compliance suite stays green
+- [x] GET and HEAD call the module; no handler re-encodes range shapes into header math
+- [x] Oversized suffix range has a defined, correct response (clamp or unsatisfiable), covered by a unit test
+- [x] Regression tests exist for each of the three historical range/status fixes (200-vs-206 for non-Range GET, suffix-value handling, byte-range math) — note: the suffix-value regression (#22) needed the discriminator restored to the post-#22 form (`suffix != null` guard inside the `in` check), which the initial extraction had regressed; now covered by a `{suffix: null}` test
+- [x] Litmus compliance suite stays green

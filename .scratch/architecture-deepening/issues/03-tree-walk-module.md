@@ -4,9 +4,9 @@
 
 **Blocked by:** 01 — Collection seam & dead-code cleanup, 02 — Local test seam
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] All recursive listing in DELETE/COPY/MOVE routes through the shared walk; no handler re-implements pagination or prefix arithmetic
-- [ ] Per-object lock handling (strip / preserve / ignore) is expressed as one policy per operation; COPY and MOVE behave exactly as before
-- [ ] Unit tests cover the walk against a fake cursor'd listing: root collection, nested collection, empty subtree
-- [ ] Litmus compliance suite (basic, copymove) stays green
+- [x] All recursive listing in DELETE/COPY/MOVE routes through the shared walk; no handler re-implements pagination or prefix arithmetic
+- [x] Per-object lock handling (strip / preserve / ignore) is expressed as one policy per operation; COPY and MOVE behave exactly as before — note: the policy lives at the call site (one `stripLockMetadata`/`preserveLocks` call per handler) rather than threaded through the walk, because the walk is traversal-only and never writes; the divergence is still single-place per concept
+- [x] Unit tests cover the walk against a fake cursor'd listing: root collection, nested collection, empty subtree
+- [x] Litmus compliance suite (basic, copymove) stays green

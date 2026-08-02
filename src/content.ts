@@ -11,7 +11,10 @@ export function calcContentRange(object: R2ObjectBody): ContentRange {
 	let rangeEnd = object.size - 1;
 	if (object.range) {
 		if ('suffix' in object.range) {
-			rangeOffset = Math.max(0, object.size - object.range.suffix);
+			// Also guard the value: R2 can return the suffix key with a null value (#22).
+			if (object.range.suffix != null) {
+				rangeOffset = Math.max(0, object.size - object.range.suffix);
+			}
 		} else {
 			rangeOffset = object.range.offset ?? 0;
 			let length = object.range.length ?? object.size - rangeOffset;
@@ -26,7 +29,7 @@ const isR2ObjectBody = (object: R2Object | R2ObjectBody): object is R2ObjectBody
 };
 
 /** Serve a single object's content (GET semantics); HEAD callers discard the body. */
-export async function serveObject(bucket: R2Bucket, request: Request, resourcePath: string): Promise<Response> {
+export async function serveObject(request: Request, bucket: R2Bucket, resourcePath: string): Promise<Response> {
 	let object = await bucket.get(resourcePath, {
 		onlyIf: request.headers,
 		range: request.headers,
@@ -82,15 +85,5 @@ export async function serveObject(bucket: R2Bucket, request: Request, resourcePa
 					}
 				: {}),
 		},
-	});
-}
-
-/** HEAD: status and headers only, without a body. */
-export async function serveHead(bucket: R2Bucket, request: Request, resourcePath: string): Promise<Response> {
-	let response = await serveObject(bucket, request, resourcePath);
-	return new Response(null, {
-		status: response.status,
-		statusText: response.statusText,
-		headers: response.headers,
 	});
 }
