@@ -95,6 +95,11 @@ function makeResourcePath(request: Request): string {
 	return decodeResourcePath(new URL(request.url).pathname);
 }
 
+/** A URL ending in “/” (ignoring any query string) addresses a collection. */
+function isDirectoryRequest(request: Request): boolean {
+	return new URL(request.url).pathname.endsWith('/');
+}
+
 function parseDestinationPath(destinationHeader: string, requestUrl: string): string | null {
 	try {
 		let destinationUrl = new URL(destinationHeader, requestUrl);
@@ -401,7 +406,7 @@ function generatePropfindResponse(object: R2Object | null, propfindRequest: Prop
 async function handleGet(request: Request, bucket: R2Bucket): Promise<Response> {
 	let resourcePath = makeResourcePath(request);
 
-	if (request.url.endsWith('/')) {
+	if (isDirectoryRequest(request)) {
 		if (resourcePath !== '') {
 			let resource = await bucket.head(resourcePath);
 			if (resource === null || !isCollection(resource.customMetadata)) {
@@ -447,7 +452,7 @@ async function handleHead(request: Request, bucket: R2Bucket): Promise<Response>
 }
 
 async function handlePut(request: Request, bucket: R2Bucket): Promise<Response> {
-	if (request.url.endsWith('/')) {
+	if (isDirectoryRequest(request)) {
 		return new Response('Method Not Allowed', { status: 405 });
 	}
 
@@ -457,6 +462,9 @@ async function handlePut(request: Request, bucket: R2Bucket): Promise<Response> 
 		return lockResponse;
 	}
 	let existing = await bucket.head(resourcePath);
+	if (existing !== null && isCollection(existing.customMetadata)) {
+		return new Response('Method Not Allowed', { status: 405 });
+	}
 
 	// Check if the parent directory exists
 	let dirpath = getParentPath(resourcePath);
@@ -464,7 +472,11 @@ async function handlePut(request: Request, bucket: R2Bucket): Promise<Response> 
 		return new Response('Conflict', { status: 409 });
 	}
 
-	let body = await request.arrayBuffer();
+	let conditionalHeadersPresent = ['If-Match', 'If-None-Match', 'If-Modified-Since', 'If-Unmodified-Since'].some(
+		(name) => request.headers.has(name),
+	);
+	// ponytail: conditional puts buffer the body — with a stream R2 may drain it before reporting a failed precondition.
+	let body: BodyInit = conditionalHeadersPresent ? await request.arrayBuffer() : (request.body ?? '');
 	await bucket.put(resourcePath, body, {
 		onlyIf: request.headers,
 		httpMetadata: request.headers,
@@ -529,58 +541,56 @@ async function handleMkcol(request: Request, bucket: R2Bucket): Promise<Response
 	return new Response('', { status: 201 });
 }
 
+/** Convert an async generator of string chunks into a streaming response body. */
+function streamFromChunks(chunks: AsyncGenerator<string>): ReadableStream<Uint8Array> {
+	let encoder = new TextEncoder();
+	return new ReadableStream({
+		async pull(controller) {
+			let { done, value } = await chunks.next();
+			if (done) {
+				controller.close();
+			} else {
+				controller.enqueue(encoder.encode(value));
+			}
+		},
+	});
+}
+
 async function handlePropfind(request: Request, bucket: R2Bucket): Promise<Response> {
 	let resourcePath = makeResourcePath(request);
-	let propfindRequest = parsePropfindRequest(await request.text());
-	if (propfindRequest === null) {
+	let parsedPropfind = parsePropfindRequest(await request.text());
+	if (parsedPropfind === null) {
+		return new Response('Bad Request', { status: 400 });
+	}
+	const propfindRequest = parsedPropfind;
+	// Validate Depth up front: once streaming starts the status code is fixed.
+	let depth = request.headers.get('Depth') ?? 'infinity';
+	if (depth !== '0' && depth !== '1' && depth !== 'infinity') {
 		return new Response('Bad Request', { status: 400 });
 	}
 
-	let page = `<?xml version="1.0" encoding="utf-8"?>
-<multistatus xmlns="DAV:">`;
-
-	let isCollectionResource: boolean;
-	if (resourcePath === '') {
-		page += generatePropfindResponse(null, propfindRequest);
-		isCollectionResource = true;
-	} else {
-		let object = await bucket.head(resourcePath);
-		if (object === null) {
+	let target: R2Object | null = null;
+	if (resourcePath !== '') {
+		target = await bucket.head(resourcePath);
+		if (target === null) {
 			return new Response('Not Found', { status: 404 });
 		}
-		isCollectionResource = isCollection(object.customMetadata);
-		page += generatePropfindResponse(object, propfindRequest);
 	}
+	let isCollectionResource = resourcePath === '' || isCollection(target?.customMetadata);
 
-	if (isCollectionResource) {
-		let depth = request.headers.get('Depth') ?? 'infinity';
-		switch (depth) {
-			case '0':
-				break;
-			case '1':
-				{
-					let prefix = resourcePath === '' ? resourcePath : resourcePath + '/';
-					for await (let object of listObjects(bucket, prefix)) {
-						page += generatePropfindResponse(object, propfindRequest);
-					}
-				}
-				break;
-			case 'infinity':
-				{
-					let prefix = resourcePath === '' ? resourcePath : resourcePath + '/';
-					for await (let object of listObjects(bucket, prefix, true)) {
-						page += generatePropfindResponse(object, propfindRequest);
-					}
-				}
-				break;
-			default: {
-				return new Response('Bad Request', { status: 400 });
+	async function* chunks(): AsyncGenerator<string> {
+		yield `<?xml version="1.0" encoding="utf-8"?>\n<multistatus xmlns="DAV:">`;
+		yield generatePropfindResponse(target, propfindRequest);
+		if (isCollectionResource && depth !== '0') {
+			let prefix = resourcePath === '' ? '' : resourcePath + '/';
+			for await (let object of listObjects(bucket, prefix, depth === 'infinity')) {
+				yield generatePropfindResponse(object, propfindRequest);
 			}
 		}
+		yield '\n</multistatus>\n';
 	}
 
-	page += '\n</multistatus>\n';
-	return new Response(page, {
+	return new Response(streamFromChunks(chunks()), {
 		status: 207,
 		headers: {
 			'Content-Type': 'application/xml; charset=utf-8',
@@ -636,7 +646,8 @@ async function handleProppatch(request: Request, bucket: R2Bucket): Promise<Resp
 
 	const hasFailures = failedSetProperties.length > 0 || failedRemoveProperties.length > 0;
 	if (!hasFailures) {
-		// Update the object's metadata
+		// ponytail: R2 has no metadata-update API, so this re-uploads the whole body through the worker —
+		// large objects pay a full read+write per PROPPATCH; upgrade if R2 ever ships metadata updates.
 		const src = await bucket.get(object.key);
 		if (src === null) {
 			return new Response('Not Found', { status: 404 });
@@ -741,11 +752,8 @@ async function handleCopy(request: Request, bucket: R2Bucket): Promise<Response>
 						});
 					}
 				};
-				let promiseArray = [copy(resource)];
-				for await (let object of listObjects(bucket, prefix, true)) {
-					promiseArray.push(copy(object));
-				}
-				await Promise.all(promiseArray);
+				await copy(resource);
+				await forEachBatched(listObjects(bucket, prefix, true), copy);
 				if (destinationExists) {
 					return new Response(null, { status: 204 });
 				} else {
@@ -871,11 +879,8 @@ async function handleMove(request: Request, bucket: R2Bucket): Promise<Response>
 						await bucket.delete(object.key);
 					}
 				};
-				let promiseArray = [move(resource)];
-				for await (let object of listObjects(bucket, prefix, true)) {
-					promiseArray.push(move(object));
-				}
-				await Promise.all(promiseArray);
+				await move(resource);
+				await forEachBatched(listObjects(bucket, prefix, true), move);
 				if (destinationExists) {
 					return new Response(null, { status: 204 });
 				} else {
@@ -946,7 +951,7 @@ async function handleLock(request: Request, bucket: R2Bucket): Promise<Response>
 		if (!(await hasCollectionResource(bucket, getParentPath(resourcePath)))) {
 			return new Response('Conflict', { status: 409 });
 		}
-		if (request.url.endsWith('/')) {
+		if (isDirectoryRequest(request)) {
 			return new Response('Conflict', { status: 409 });
 		}
 
@@ -1060,6 +1065,24 @@ async function handleUnlock(request: Request, bucket: R2Bucket): Promise<Respons
 }
 
 const DAV_CLASS = '1, 2';
+
+/** Consume an async source with bounded concurrency (R2 ops are request-scoped subrequests). */
+const MAX_CONCURRENT_R2_OPS = 50;
+// ponytail: batching bounds memory, not the ~1000-subrequest budget — trees beyond ~500 objects
+// still exhaust it per request; a queue (Durable Objects) is the upgrade path if that bites.
+async function forEachBatched<T>(source: AsyncIterable<T>, fn: (item: T) => Promise<void>): Promise<void> {
+	let batch: T[] = [];
+	for await (const item of source) {
+		batch.push(item);
+		if (batch.length >= MAX_CONCURRENT_R2_OPS) {
+			await Promise.all(batch.map(fn));
+			batch = [];
+		}
+	}
+	if (batch.length > 0) {
+		await Promise.all(batch.map(fn));
+	}
+}
 const SUPPORT_METHODS = [
 	'OPTIONS',
 	'PROPFIND',
@@ -1134,10 +1157,11 @@ async function dispatchHandler(request: Request, bucket: R2Bucket): Promise<Resp
 function isAuthorized(authorizationHeader: string, username: string, password: string): boolean {
 	const encoder = new TextEncoder();
 
-	const header = encoder.encode(authorizationHeader);
-	const expected = encoder.encode(`Basic ${btoa(`${username}:${password}`)}`);
+	// btoa only accepts Latin1 chars, so encode UTF-8 bytes first to support non-ASCII credentials.
+	let encodedCredentials = new TextEncoder().encode(`${username}:${password}`);
+	let expected = encoder.encode(`Basic ${btoa(String.fromCharCode(...encodedCredentials))}`);
 
-	return timingSafeEqual(header, expected);
+	return timingSafeEqual(encoder.encode(authorizationHeader), expected);
 }
 
 function timingSafeEqual(left: Uint8Array, right: Uint8Array): boolean {

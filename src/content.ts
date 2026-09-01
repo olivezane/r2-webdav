@@ -58,6 +58,8 @@ export async function serveObject(request: Request, bucket: R2Bucket, resourcePa
 			'Accept-Ranges': 'bytes',
 			'Content-Type': object.httpMetadata?.contentType ?? 'application/octet-stream',
 			'Content-Length': contentLength.toString(),
+			ETag: object.httpEtag,
+			'Last-Modified': object.uploaded.toUTCString(),
 			...(rangeRequested ? { 'Content-Range': `bytes ${rangeOffset}-${rangeEnd}/${object.size}` } : {}),
 			...(object.httpMetadata?.contentDisposition
 				? {

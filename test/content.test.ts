@@ -74,6 +74,13 @@ test('GET with a suffix range returns the tail (regression: suffix value handlin
 	assert.equal(response.headers.get('Content-Range'), 'bytes 5-9/10');
 });
 
+test('GET/HEAD carry ETag and Last-Modified so clients can make conditional requests', async () => {
+	let bucket = fakeBucket(() => objectBody());
+	let response = await serveObject(new Request('http://x/file'), bucket, 'file');
+	assert.equal(response.headers.get('ETag'), '"etag"');
+	assert.equal(response.headers.get('Last-Modified'), 'Thu, 01 Jan 1970 00:00:00 GMT');
+});
+
 test('missing object returns 404', async () => {
 	let bucket = fakeBucket(() => null);
 	let response = await serveObject(new Request('http://x/file'), bucket, 'file');
