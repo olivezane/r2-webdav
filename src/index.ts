@@ -88,7 +88,11 @@ type ProppatchOperation = {
 };
 
 const DEFAULT_LOCK_TIMEOUT = 3600;
-const MAX_LOCK_TIMEOUT = 365 * 24 * 60 * 60;
+// shared 锁不限制操作,把它当续期通道会让单对象无限增长至 metadata 上限
+const MAX_LOCK_TIMEOUT = 24 * 60 * 60;
+const MAX_LOCKS_PER_RESOURCE = 20;
+// 整个 customMetadata 会被 worker 序列化成 header,R2 的上限是 8KB;留出余量避免边界写入失败
+const MAX_CUSTOM_METADATA_BYTES = 7000;
 const VALID_LOCK_DEPTHS = ['0', 'infinity'] as const;
 const LOCK_METADATA_KEYS = [
 	'lock_token',
@@ -234,16 +238,71 @@ function getDeadProperty(
 	if (value === undefined) {
 		return null;
 	}
-	return JSON.parse(value) as DeadProperty;
+	return parseDeadProperty(value);
 }
 
 function getDeadProperties(metadata: Record<string, string> | undefined): DeadProperty[] {
 	if (metadata === undefined) {
 		return [];
 	}
-	return Object.entries(metadata)
-		.filter(([key]) => key.startsWith(DEAD_PROPERTY_PREFIX))
-		.map(([, value]) => JSON.parse(value) as DeadProperty);
+	let properties: DeadProperty[] = [];
+	for (const [key, value] of Object.entries(metadata)) {
+		if (!key.startsWith(DEAD_PROPERTY_PREFIX)) {
+			continue;
+		}
+		let property = parseDeadProperty(value);
+		if (property !== null) {
+			properties.push(property);
+		}
+	}
+	return properties;
+}
+
+// R2 里的 customMetadata 是外部可控数据(且是历史写入的),解析失败必须降级为跳过,而不是让整个 PROPFIND 500。
+function parseDeadProperty(value: string): DeadProperty | null {
+	try {
+		let parsed = JSON.parse(value) as unknown;
+		if (parsed === null || typeof parsed !== 'object') {
+			return null;
+		}
+		let property = parsed as Partial<DeadProperty>;
+		if (
+			typeof property.namespaceURI !== 'string' ||
+			typeof property.localName !== 'string' ||
+			typeof property.valueXml !== 'string' ||
+			// != null 同时接受 null 与缺失(null 表示无前缀),兼容历史写入的数据
+			(property.prefix != null && typeof property.prefix !== 'string')
+		) {
+			return null;
+		}
+		return {
+			namespaceURI: property.namespaceURI,
+			localName: property.localName,
+			prefix: property.prefix ?? null,
+			valueXml: property.valueXml,
+		};
+	} catch {
+		return null;
+	}
+}
+
+// 死属性只允许承载文本。元素、注释、PI、CDATA 都放行的话,攻击者就能闭合当前标签、伪造同级的 <response> 块。
+function sanitizeValueXml(valueXml: string): string {
+	if (valueXml === '') {
+		return '';
+	}
+	let document = parseXmlDocument(`<wrapper>${valueXml}</wrapper>`);
+	if (document === null) {
+		// 解析不了的内容一律当纯文本输出,不回退到原始字节
+		return escapeXml(valueXml);
+	}
+	let text = '';
+	for (let child = document.documentElement.firstChild; child !== null; child = child.nextSibling) {
+		if (child.nodeType === 3 || child.nodeType === 4) {
+			text += child.nodeValue ?? '';
+		}
+	}
+	return escapeXml(text);
 }
 
 function renderPropertyElement(property: DeadProperty): string {
@@ -254,7 +313,7 @@ function renderPropertyElement(property: DeadProperty): string {
 			: property.prefix
 				? ` xmlns:${property.prefix}="${escapeXml(property.namespaceURI)}"`
 				: ` xmlns="${escapeXml(property.namespaceURI)}"`;
-	return `<${qualifiedName}${namespaceDeclaration}>${property.valueXml}</${qualifiedName}>`;
+	return `<${qualifiedName}${namespaceDeclaration}>${sanitizeValueXml(property.valueXml)}</${qualifiedName}>`;
 }
 
 function renderEmptyPropertyElement(property: DeadProperty): string {
@@ -276,7 +335,7 @@ function getElementProperty(element: Element): DeadProperty | null {
 		namespaceURI: element.namespaceURI ?? '',
 		localName: element.localName,
 		prefix: element.prefix,
-		valueXml: serializeNodeChildren(element),
+		valueXml: sanitizeValueXml(serializeNodeChildren(element)),
 	};
 }
 
@@ -464,9 +523,11 @@ function withLockMetadata(
 	if (lockDetailList.length === 0) {
 		return stripLockMetadata(customMetadata);
 	}
+	// 锁记录是按对象存储的,超过 R2 metadata 上限后写入会整对象失败 → 只保留最新的一批
+	let cappedLockDetails = lockDetailList.slice(-MAX_LOCKS_PER_RESOURCE);
 	return {
 		...stripLockMetadata(customMetadata),
-		[LOCK_RECORDS_METADATA_KEY]: JSON.stringify(lockDetailList),
+		[LOCK_RECORDS_METADATA_KEY]: JSON.stringify(cappedLockDetails),
 	};
 }
 
@@ -478,10 +539,39 @@ function getPreservedCustomMetadata(customMetadata: Record<string, string> | und
 	return withLockMetadata(customMetadata, lockDetails);
 }
 
+// 超限时写入会让整个对象更新失败(不仅是元数据),所以写入前先按字节预判。
+// shortcut: 按 JSON+header 粗估,不精确对齐 R2 的内部计算方式。
+function estimateCustomMetadataBytes(customMetadata: Record<string, string>): number {
+	let encoder = new TextEncoder();
+	return (
+		encoder.encode(JSON.stringify(customMetadata)).length +
+		Object.entries(customMetadata).reduce((total, [key, value]) => total + key.length + value.length, 0)
+	);
+}
+
+function fitsCustomMetadata(customMetadata: Record<string, string>): boolean {
+	return estimateCustomMetadataBytes(customMetadata) <= MAX_CUSTOM_METADATA_BYTES;
+}
+
+function shrinkCustomMetadataToFit(customMetadata: Record<string, string>): Record<string, string> {
+	if (fitsCustomMetadata(customMetadata)) {
+		return customMetadata;
+	}
+	let deadPropertyKeys = Object.keys(customMetadata).filter((key) => key.startsWith(DEAD_PROPERTY_PREFIX));
+	let result = { ...customMetadata };
+	while (deadPropertyKeys.length > 0 && !fitsCustomMetadata(result)) {
+		delete result[deadPropertyKeys.shift() as string];
+	}
+	return result;
+}
+
 function isProtectedProperty(propName: string | DeadProperty): boolean {
 	let localPropName = typeof propName === 'string' ? (propName.split(':').pop() ?? propName) : propName.localName;
 	return (
-		LOCK_METADATA_KEYS.includes(localPropName) || localPropName === 'supportedlock' || localPropName === 'lockdiscovery'
+		LOCK_METADATA_KEYS.includes(localPropName) ||
+		localPropName === 'supportedlock' ||
+		localPropName === 'lockdiscovery' ||
+		localPropName === 'resourcetype'
 	);
 }
 
@@ -499,8 +589,9 @@ function parseTimeout(timeoutHeader: string | null): { timeout: string; expiresA
 
 	for (const item of timeoutHeader.split(',').map((value) => value.trim())) {
 		if (item.toLowerCase() === 'infinite') {
+			// 原本返回字面量 "Infinite" 且真的锁 365 天;改为报出实际授予的时长,与 expiresAt 保持一致
 			return {
-				timeout: 'Infinite',
+				timeout: `Second-${MAX_LOCK_TIMEOUT}`,
 				expiresAt: Date.now() + MAX_LOCK_TIMEOUT * 1000,
 			};
 		}
@@ -609,6 +700,10 @@ function fromR2Object(object: R2Object | null | undefined): DavProperties {
 
 function getLivePropertyValue(object: R2Object | null, property: DeadProperty): string | undefined {
 	if (property.namespaceURI !== DAV_NAMESPACE) {
+		return undefined;
+	}
+	// 属性名来自客户端,直接下标会命中原型链(如 constructor)而拿到函数对象,后续拼串即 500
+	if (!Object.prototype.hasOwnProperty.call(fromR2Object(object), property.localName)) {
 		return undefined;
 	}
 	return fromR2Object(object)[property.localName as keyof DavProperties];
@@ -774,6 +869,13 @@ async function handle_get(request: Request, bucket: R2Bucket): Promise<Response>
 			const { rangeOffset, rangeEnd } = calcContentRange(object);
 			const contentLength = rangeEnd - rangeOffset + 1;
 			const rangeRequested = request.headers.has('Range') && object.range !== undefined;
+			if (rangeRequested && rangeEnd < rangeOffset) {
+				// 完全落在对象之外的 Range 不能返回负的长度(旧版就是负 Content-Length 导致 500)
+				return new Response(null, {
+					status: 416,
+					headers: { 'Accept-Ranges': 'bytes', 'Content-Range': `bytes */${object.size}` },
+				});
+			}
 			return new Response(object.body, {
 				status: rangeRequested ? 206 : 200,
 				headers: {
@@ -818,13 +920,14 @@ function calcContentRange(object: R2ObjectBody) {
 	if (object.range) {
 		if ('suffix' in object.range) {
 			// Case 3: {suffix: number}
-			rangeOffset = object.size - object.range.suffix;
+			rangeOffset = Math.max(object.size - object.range.suffix, 0);
 		} else {
 			// Case 1: {offset: number, length?: number}
 			// Case 2: {offset?: number, length: number}
-			rangeOffset = object.range.offset ?? 0;
+			// 空对象的 offset/length 可以落在对象之外,不钳位会得到负数 Content-Length 而 500
+			rangeOffset = Math.min(Math.max(object.range.offset ?? 0, 0), object.size);
 			let length = object.range.length ?? object.size - rangeOffset;
-			rangeEnd = Math.min(rangeOffset + length - 1, object.size - 1);
+			rangeEnd = Math.min(Math.max(rangeOffset + length - 1, rangeOffset - 1), object.size - 1);
 		}
 	}
 	return { rangeOffset, rangeEnd };
@@ -1099,6 +1202,12 @@ async function handle_proppatch(request: Request, bucket: R2Bucket): Promise<Res
 
 	const hasFailures = failedSetProperties.length > 0 || failedRemoveProperties.length > 0;
 	if (!hasFailures) {
+		// 元数据超限时拒绝写入并明确告知客户端,而不是静默丢掉刚设的属性
+		const customMetadataToWrite = shrinkCustomMetadataToFit(customMetadata);
+		if (Object.keys(customMetadataToWrite).length !== Object.keys(customMetadata).length) {
+			return new Response('Insufficient Storage', { status: 507 });
+		}
+
 		// 更新对象的元数据
 		const src = await bucket.get(object.key);
 		if (src === null) {
@@ -1107,7 +1216,7 @@ async function handle_proppatch(request: Request, bucket: R2Bucket): Promise<Res
 
 		await bucket.put(object.key, src.body, {
 			httpMetadata: object.httpMetadata,
-			customMetadata: customMetadata,
+			customMetadata: customMetadataToWrite,
 		});
 	}
 
@@ -1376,9 +1485,10 @@ async function handle_lock(request: Request, bucket: R2Bucket): Promise<Response
 	let { timeout, expiresAt } = parseTimeout(request.headers.get('Timeout'));
 	let body = await request.text();
 	// Per WebDAV, an empty LOCK request body indicates a lock refresh operation.
-	let requestedScope: LockDetails['scope'] = /<shared\b/i.test(body) ? 'shared' : 'exclusive';
+	let requestedScope: LockDetails['scope'] = /<(?:[A-Za-z_][\w.-]*:)?shared[\s/>]/i.test(body) ? 'shared' : 'exclusive';
 	let requestLockTokens = getRequestLockTokens(request);
-	if (body !== '' && !/<write\b/i.test(body)) {
+	// 客户端普遍用带前缀的 XML(<D:write/>),只匹配 <write 会把合法请求当 400 拒掉
+	if (body !== '' && !/<(?:[A-Za-z_][\w.-]*:)?write[\s/>]/i.test(body)) {
 		return new Response('Bad Request', { status: 400 });
 	}
 	let owner = extractLockOwner(body);
@@ -1462,9 +1572,15 @@ async function handle_lock(request: Request, bucket: R2Bucket): Promise<Response
 		return new Response('Not Found', { status: 404 });
 	}
 
+	let lockMetadata = withLockMetadata(resource.customMetadata, updatedLocks);
+	if (!fitsCustomMetadata(lockMetadata)) {
+		// 拒绝加锁而不是写入一个会永久损坏的对象(损坏后连 UNLOCK 都写不成功)
+		return new Response('Insufficient Storage', { status: 507 });
+	}
+
 	await bucket.put(resource.key, source.body, {
 		httpMetadata: source.httpMetadata,
-		customMetadata: withLockMetadata(resource.customMetadata, updatedLocks),
+		customMetadata: lockMetadata,
 	});
 
 	return new Response(
@@ -1619,10 +1735,20 @@ export default {
 			});
 		}
 
-		let response: Response = await dispatch_handler(request, bucket);
+		let response: Response;
+		try {
+			response = await dispatch_handler(request, bucket);
+		} catch (error) {
+			// 未捕获异常会直接暴露为 Worker 错误页,统一兜成 500
+			console.error('Unhandled exception while dispatching request', error);
+			response = new Response('Internal Server Error', { status: 500 });
+		}
 
 		// Set CORS headers
-		response.headers.set('Access-Control-Allow-Origin', request.headers.get('Origin') ?? '*');
+		// 反射任意 Origin 只是丑陋实践,但一旦有人把 Allow-Credentials 改成 true 就是完整的 CSRF;只回显自身 origin,其余用通配。
+		let origin = request.headers.get('Origin');
+		let selfOrigin = new URL(request.url).origin;
+		response.headers.set('Access-Control-Allow-Origin', origin !== null && origin === selfOrigin ? origin : '*');
 		response.headers.set('Access-Control-Allow-Methods', SUPPORT_METHODS.join(', '));
 		response.headers.set(
 			'Access-Control-Allow-Headers',
