@@ -58,8 +58,8 @@ function fakeBucket(seed: Record<string, Obj> = {}) {
 			store.set(key, { body, httpMetadata: opts?.httpMetadata, customMetadata: opts?.customMetadata ?? {} });
 			return this.head(key);
 		},
-		async delete(key: string) {
-			store.delete(key);
+		async delete(key: string | string[]) {
+			for (const k of Array.isArray(key) ? key : [key]) store.delete(k);
 		},
 		list(opts: { prefix?: string; cursor?: string } = {}) {
 			let objects = [...store.entries()]
@@ -226,4 +226,115 @@ test('顶层兜底: 未捕获异常返回 500 而不是抛出去', async () => {
 	};
 	let res = await call(bucket, '/a.txt', { method: 'PROPFIND', headers: { Depth: '0' } });
 	assert.equal(res.status, 500);
+});
+
+test('RFC 4918 §15.1/§15.6: getetag 带引号、creationdate 为 RFC 3339、displayname 是资源名', async () => {
+	let bucket = fakeBucket({ '': COLLECTION, 'a.txt': { body: new Uint8Array(), customMetadata: {} } });
+	let res = await call(bucket, '/a.txt', { method: 'PROPFIND', headers: { Depth: '0' } });
+	let body = await res.text();
+	// 值会过 escapeXml,引号可被转义;XML 解析后仍是 "e"
+	assert.match(body, /<getetag>(?:"|&quot;)e(?:"|&quot;)<\/getetag>/);
+	assert.match(body, /<creationdate>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z<\/creationdate>/);
+	assert.ok(body.includes('<displayname>a.txt</displayname>'), body);
+});
+
+test('RFC 9110 §15.4.5: GET 返回 ETag 与 Last-Modified', async () => {
+	let bucket = fakeBucket({
+		'': COLLECTION,
+		'a.txt': { body: new TextEncoder().encode('hi'), customMetadata: {} },
+	});
+	let res = await call(bucket, '/a.txt');
+	assert.equal(res.status, 200);
+	assert.equal(res.headers.get('ETag'), '"e"');
+	assert.equal(res.headers.get('Last-Modified'), new Date(0).toUTCString());
+});
+
+test('RFC 4918 §9.7.2: PUT 到已存在的 collection 返回 405 且不破坏目录', async () => {
+	let bucket = fakeBucket({
+		'': COLLECTION,
+		dir: COLLECTION,
+		'dir/x.txt': { body: new TextEncoder().encode('x'), customMetadata: {} },
+	});
+	let res = await call(bucket, '/dir', { method: 'PUT', body: 'boom' });
+	assert.equal(res.status, 405);
+	assert.ok(res.headers.get('Allow')?.includes('PUT'));
+	assert.equal((bucket as any).store.get('dir').customMetadata.resourcetype, '<collection />');
+	assert.ok((bucket as any).store.has('dir/x.txt'));
+});
+
+test('RFC 9110 §15.5.6: 405 带 Allow', async () => {
+	let bucket = fakeBucket({ '': COLLECTION, dir: COLLECTION });
+	let res = await call(bucket, '/dir/', { method: 'MKCOL' });
+	assert.equal(res.status, 405);
+	assert.ok(res.headers.get('Allow')?.includes('MKCOL'));
+});
+
+test('RFC 4918 §9.1/§9.2: 非 DAV: 命名空间的请求体返回 400', async () => {
+	let bucket = fakeBucket({ '': COLLECTION, 'a.txt': { body: new Uint8Array(), customMetadata: {} } });
+	let propfind = await call(bucket, '/', {
+		method: 'PROPFIND',
+		headers: { Depth: '0' },
+		body: '<propfind xmlns="urn:evil"><allprop/></propfind>',
+	});
+	assert.equal(propfind.status, 400);
+	let proppatch = await call(bucket, '/a.txt', {
+		method: 'PROPPATCH',
+		body: '<propertyupdate xmlns="urn:evil"><set><prop><x>1</x></prop></set></propertyupdate>',
+	});
+	assert.equal(proppatch.status, 400);
+});
+
+test('RFC 4918 §10.4: If 头里的 ETag 条件生效', async () => {
+	let bucket = fakeBucket({
+		'': COLLECTION,
+		'a.txt': { body: new TextEncoder().encode('x'), customMetadata: {} },
+	});
+	let stale = await call(bucket, '/a.txt', { method: 'PUT', body: 'y', headers: { If: '(["nope"])' } });
+	assert.equal(stale.status, 412);
+	let fresh = await call(bucket, '/a.txt', { method: 'PUT', body: 'y', headers: { If: '(["e"])' } });
+	assert.equal(fresh.status, 204);
+	let negated = await call(bucket, '/a.txt', { method: 'PUT', body: 'z', headers: { If: '(Not ["e"])' } });
+	assert.equal(negated.status, 412);
+});
+
+test('RFC 4918 §9.8.4: COPY 覆盖 collection 时目标成员被清空而不是合并', async () => {
+	let bucket = fakeBucket({
+		'': COLLECTION,
+		src: COLLECTION,
+		'src/a.txt': { body: new TextEncoder().encode('a'), customMetadata: {} },
+		dst: COLLECTION,
+		'dst/stale.txt': { body: new TextEncoder().encode('s'), customMetadata: {} },
+	});
+	let res = await call(bucket, '/src', {
+		method: 'COPY',
+		headers: { Destination: `${BASE}/dst`, Depth: 'infinity' },
+	});
+	assert.equal(res.status, 204);
+	assert.ok((bucket as any).store.has('dst/a.txt'));
+	assert.ok(!(bucket as any).store.has('dst/stale.txt'));
+});
+
+test('RFC 4918 §10.6: 非法 Overwrite 值返回 400', async () => {
+	let bucket = fakeBucket({ '': COLLECTION, 'a.txt': { body: new Uint8Array(), customMetadata: {} } });
+	let res = await call(bucket, '/a.txt', {
+		method: 'COPY',
+		headers: { Destination: `${BASE}/b.txt`, Overwrite: 'yes' },
+	});
+	assert.equal(res.status, 400);
+});
+
+test('RFC 4918 §9.10.2: 刷新锁不回 Lock-Token,并回报 Timeout', async () => {
+	let bucket = fakeBucket({ '': COLLECTION, 'a.txt': { body: new Uint8Array(), customMetadata: {} } });
+	let body =
+		'<?xml version="1.0"?><D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockinfo>';
+	let created = await call(bucket, '/a.txt', { method: 'LOCK', body });
+	assert.equal(created.status, 201);
+	let token = created.headers.get('Lock-Token');
+	assert.equal(created.headers.get('Timeout'), 'Second-3600');
+	assert.ok(token);
+
+	let refreshed = await call(bucket, '/a.txt', { method: 'LOCK', headers: { If: `(${token})` } });
+	assert.equal(refreshed.status, 200);
+	assert.equal(refreshed.headers.get('Lock-Token'), null);
+	assert.ok((await refreshed.text()).includes('<lockdiscovery>'));
 });

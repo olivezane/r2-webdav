@@ -119,6 +119,31 @@ function escapeXml(value: string): string {
 		.replaceAll("'", '&apos;');
 }
 
+// entity-tag 必须带双引号(RFC 9110 §8.8.3),R2 给的是裸 opaque-tag
+function formatEtag(etag: string): string {
+	return `"${etag}"`;
+}
+
+// RFC 4918 §15.2: displayname 是资源名,不是 Content-Disposition
+function getDisplayName(key: string): string | undefined {
+	let name = key.split('/').pop() ?? '';
+	return name === '' ? undefined : name;
+}
+
+// RFC 9110 §15.5.6: 405 必须带 Allow
+function methodNotAllowed(): Response {
+	return new Response('Method Not Allowed', { status: 405, headers: { Allow: SUPPORT_METHODS.join(', ') } });
+}
+
+// RFC 4918 §10.6: Overwrite 只允许 T/F,其它值按 400 拒绝
+function parseOverwriteHeader(request: Request): boolean | null {
+	let value = request.headers.get('Overwrite');
+	if (value === null || value === 'T') {
+		return true;
+	}
+	return value === 'F' ? false : null;
+}
+
 function getResourceHref(key: string, isCollection: boolean): string {
 	const encodeHrefPath = (href: string): string => {
 		if (href === '/') {
@@ -369,10 +394,17 @@ function parsePropfindRequest(body: string): PropfindRequest | null {
 		return { mode: 'allprop' };
 	}
 	let document = parseXmlDocument(body);
-	if (document === null || document.documentElement.localName.toLowerCase() !== 'propfind') {
+	if (
+		document === null ||
+		document.documentElement.localName.toLowerCase() !== 'propfind' ||
+		document.documentElement.namespaceURI !== DAV_NAMESPACE
+	) {
 		return null;
 	}
-	let propfindChildren = getChildElements(document.documentElement);
+	// 结构元素必须在 DAV: 命名空间;prop 里的属性元素本身可以是任意命名空间
+	let propfindChildren = getChildElements(document.documentElement).filter(
+		(child) => child.namespaceURI === DAV_NAMESPACE,
+	);
 	if (propfindChildren.some((child) => child.localName.toLowerCase() === 'propname')) {
 		return { mode: 'propname' };
 	}
@@ -395,16 +427,24 @@ function parsePropfindRequest(body: string): PropfindRequest | null {
 
 function parseProppatchRequest(body: string): { operations: ProppatchOperation[] } | null {
 	let document = parseXmlDocument(body);
-	if (document === null || document.documentElement.localName.toLowerCase() !== 'propertyupdate') {
+	if (
+		document === null ||
+		document.documentElement.localName.toLowerCase() !== 'propertyupdate' ||
+		document.documentElement.namespaceURI !== DAV_NAMESPACE
+	) {
 		return null;
 	}
 	let operations: ProppatchOperation[] = [];
-	for (const actionElement of getChildElements(document.documentElement)) {
+	for (const actionElement of getChildElements(document.documentElement).filter(
+		(child) => child.namespaceURI === DAV_NAMESPACE,
+	)) {
 		let action = actionElement.localName.toLowerCase();
 		if (action !== 'set' && action !== 'remove') {
 			continue;
 		}
-		let propElement = getChildElements(actionElement).find((child) => child.localName.toLowerCase() === 'prop');
+		let propElement = getChildElements(actionElement).find(
+			(child) => child.localName.toLowerCase() === 'prop' && child.namespaceURI === DAV_NAMESPACE,
+		);
 		if (propElement === undefined) {
 			continue;
 		}
@@ -612,6 +652,119 @@ function parseTimeout(timeoutHeader: string | null): { timeout: string; expiresA
 	};
 }
 
+type IfList = { tag: string | null; conditions: { not: boolean; etag: string | null }[] };
+
+// RFC 4918 §10.4.2 的状态列表。解析失败返回 null,由调用方当作“没有 ETag 条件”处理。
+function parseIfHeader(header: string): IfList[] | null {
+	let lists: IfList[] = [];
+	let tag: string | null = null;
+	let index = 0;
+	let skipWhitespace = () => {
+		while (index < header.length && /\s/.test(header[index])) {
+			index++;
+		}
+	};
+
+	while (index < header.length) {
+		skipWhitespace();
+		if (index >= header.length) {
+			break;
+		}
+		if (header[index] === '<') {
+			let end = header.indexOf('>', index);
+			if (end < 0) {
+				return null;
+			}
+			tag = header.slice(index + 1, end).trim();
+			index = end + 1;
+			continue;
+		}
+		if (header[index] !== '(') {
+			return null;
+		}
+		index++;
+		let conditions: { not: boolean; etag: string | null }[] = [];
+		for (;;) {
+			skipWhitespace();
+			if (index >= header.length) {
+				return null;
+			}
+			if (header[index] === ')') {
+				index++;
+				break;
+			}
+			let not = false;
+			if (/^Not\s/i.test(header.slice(index, index + 4))) {
+				not = true;
+				index += 3;
+				skipWhitespace();
+			}
+			if (header[index] === '[') {
+				let end = header.indexOf(']', index);
+				if (end < 0) {
+					return null;
+				}
+				conditions.push({ not, etag: header.slice(index + 1, end).trim() });
+				index = end + 1;
+			} else if (header[index] === '<') {
+				let end = header.indexOf('>', index);
+				if (end < 0) {
+					return null;
+				}
+				// 状态令牌(锁令牌)的成立与否由锁检查处理
+				conditions.push({ not, etag: null });
+				index = end + 1;
+			} else {
+				return null;
+			}
+		}
+		lists.push({ tag, conditions });
+	}
+
+	return lists.length === 0 ? null : lists;
+}
+
+function normalizeEtagValue(etag: string): string {
+	return etag.trim().replace(/^W\//i, '').replace(/^"|"$/g, '');
+}
+
+// RFC 4918 §10.4.4: If 里的 ETag 条件也必须求值。返回 null 表示头里没有 ETag 条件。
+function evaluateIfHeader(request: Request, resourcePath: string, etag: string | undefined): boolean | null {
+	let header = request.headers.get('If');
+	if (header === null || !header.includes('[')) {
+		return null;
+	}
+	let lists = parseIfHeader(header);
+	if (lists === null) {
+		return null;
+	}
+	let requestPath = make_resource_path(request);
+	let applicable = lists.filter((list) => {
+		if (list.tag === null) {
+			// 无标签列表只作用于 Request-URI,不作用于 COPY/MOVE 的 Destination
+			return resourcePath === requestPath;
+		}
+		try {
+			return decodeResourcePath(new URL(list.tag, request.url).pathname) === resourcePath;
+		} catch {
+			return false;
+		}
+	});
+	if (applicable.length === 0) {
+		return true;
+	}
+	let current = etag === undefined ? undefined : normalizeEtagValue(etag);
+	return applicable.some((list) =>
+		list.conditions.every((condition) => {
+			if (condition.etag === null) {
+				return true;
+			}
+			let matches = current !== undefined && normalizeEtagValue(condition.etag) === current;
+			return condition.not ? !matches : matches;
+		}),
+	);
+}
+
 function getRequestLockTokens(request: Request): string[] {
 	let lockTokens: string[] = [];
 	let directLockToken = request.headers.get('Lock-Token');
@@ -661,7 +814,7 @@ function extractLockOwner(body: string): string | undefined {
 function fromR2Object(object: R2Object | null | undefined): DavProperties {
 	if (object === null || object === undefined) {
 		return {
-			creationdate: new Date().toUTCString(),
+			creationdate: new Date().toISOString(),
 			displayname: undefined,
 			getcontentlanguage: undefined,
 			getcontentlength: '0',
@@ -677,12 +830,12 @@ function fromR2Object(object: R2Object | null | undefined): DavProperties {
 	let isCollection = object.customMetadata?.resourcetype === '<collection />';
 	let lockDetails = getLockDetails(object.customMetadata);
 	return {
-		creationdate: object.uploaded.toUTCString(),
-		displayname: object.httpMetadata?.contentDisposition,
+		creationdate: object.uploaded.toISOString(),
+		displayname: getDisplayName(object.key),
 		getcontentlanguage: object.httpMetadata?.contentLanguage,
 		getcontentlength: object.size.toString(),
 		getcontenttype: object.httpMetadata?.contentType,
-		getetag: object.etag,
+		getetag: formatEtag(object.etag),
 		getlastmodified: object.uploaded.toUTCString(),
 		resourcetype: object.customMetadata?.resourcetype ?? '',
 		supportedlock: getSupportedLock(),
@@ -734,6 +887,12 @@ async function assertLockPermission(
 ): Promise<Response | null> {
 	if (hasAlwaysFalseIfCondition(request)) {
 		return new Response('Precondition Failed', { status: 412 });
+	}
+	if (request.headers.get('If')?.includes('[')) {
+		let current = await bucket.head(resourcePath);
+		if (evaluateIfHeader(request, resourcePath, current?.etag) === false) {
+			return new Response('Precondition Failed', { status: 412 });
+		}
 	}
 	let lockTokens = getRequestLockTokens(request);
 	let candidates: string[] = [];
@@ -860,10 +1019,20 @@ async function handle_get(request: Request, bucket: R2Bucket): Promise<Response>
 
 		if (object === null) {
 			return new Response('Not Found', { status: 404 });
-		} else if (!isR2ObjectBody(object)) {
+		}
+		let validators = {
+			ETag: formatEtag(object.etag),
+			'Last-Modified': object.uploaded.toUTCString(),
+		};
+		if (evaluateIfHeader(request, resource_path, object.etag) === false) {
+			return new Response(null, { status: 412, headers: validators });
+		}
+		if (!isR2ObjectBody(object)) {
 			// A satisfied If-None-Match means "not modified"; every other failed precondition is 412.
+			// RFC 9110 §15.4.5: 304 必须回报 ETag/Date 等验证器。
 			return new Response(null, {
 				status: request.headers.has('If-None-Match') ? 304 : 412,
+				headers: validators,
 			});
 		} else {
 			const { rangeOffset, rangeEnd } = calcContentRange(object);
@@ -879,6 +1048,7 @@ async function handle_get(request: Request, bucket: R2Bucket): Promise<Response>
 			return new Response(object.body, {
 				status: rangeRequested ? 206 : 200,
 				headers: {
+					...validators,
 					'Accept-Ranges': 'bytes',
 					'Content-Type': object.httpMetadata?.contentType ?? 'application/octet-stream',
 					'Content-Length': contentLength.toString(),
@@ -935,7 +1105,7 @@ function calcContentRange(object: R2ObjectBody) {
 
 async function handle_put(request: Request, bucket: R2Bucket): Promise<Response> {
 	if (request.url.endsWith('/')) {
-		return new Response('Method Not Allowed', { status: 405 });
+		return methodNotAllowed();
 	}
 
 	let resource_path = make_resource_path(request);
@@ -944,6 +1114,10 @@ async function handle_put(request: Request, bucket: R2Bucket): Promise<Response>
 		return lockResponse;
 	}
 	let existing = await bucket.head(resource_path);
+	// RFC 4918 §9.7.2: 对已存在的 collection 做 PUT 是错误,否则目录会被同名的文件覆盖、子对象变成孤儿
+	if (existing?.customMetadata?.resourcetype === '<collection />') {
+		return methodNotAllowed();
+	}
 
 	// Check if the parent directory exists
 	let dirpath = getParentPath(resource_path);
@@ -1029,7 +1203,7 @@ async function handle_mkcol(request: Request, bucket: R2Bucket): Promise<Respons
 	// Check if the resource already exists
 	let resource = await bucket.head(resource_path);
 	if (resource !== null) {
-		return new Response('Method Not Allowed', { status: 405 });
+		return methodNotAllowed();
 	}
 
 	// Check if the parent directory exists
@@ -1259,9 +1433,30 @@ async function handle_proppatch(request: Request, bucket: R2Bucket): Promise<Res
 	});
 }
 
+// COPY/MOVE 覆盖目标时先整树删除它(RFC 4918 §9.8.4: 覆盖后成员必须与源一致,不能合并)
+async function deleteDestinationResource(
+	request: Request,
+	bucket: R2Bucket,
+	destinationHeader: string,
+): Promise<Response | null> {
+	let headers = new Headers();
+	for (const headerName of INTERNAL_DELETE_FORWARD_HEADERS) {
+		let headerValue = request.headers.get(headerName);
+		if (headerValue !== null) {
+			headers.set(headerName, headerValue);
+		}
+	}
+	let response = await handle_delete(new Request(new URL(destinationHeader), { method: 'DELETE', headers }), bucket);
+	return response.ok ? null : response;
+}
+
 async function handle_copy(request: Request, bucket: R2Bucket): Promise<Response> {
 	let resource_path = make_resource_path(request);
-	let dont_overwrite = request.headers.get('Overwrite') === 'F';
+	let overwrite = parseOverwriteHeader(request);
+	if (overwrite === null) {
+		return new Response('Bad Request', { status: 400 });
+	}
+	let dont_overwrite = !overwrite;
 	let destination_header = request.headers.get('Destination');
 	if (destination_header === null) {
 		return new Response('Bad Request', { status: 400 });
@@ -1293,6 +1488,13 @@ async function handle_copy(request: Request, bucket: R2Bucket): Promise<Response
 	let resource = await bucket.head(resource_path);
 	if (resource === null) {
 		return new Response('Not Found', { status: 404 });
+	}
+
+	if (destination_exists) {
+		let deleteResponse = await deleteDestinationResource(request, bucket, destination_header);
+		if (deleteResponse !== null) {
+			return deleteResponse;
+		}
 	}
 
 	let is_dir = resource?.customMetadata?.resourcetype === '<collection />';
@@ -1362,7 +1564,10 @@ async function handle_copy(request: Request, bucket: R2Bucket): Promise<Response
 
 async function handle_move(request: Request, bucket: R2Bucket): Promise<Response> {
 	let resource_path = make_resource_path(request);
-	let overwrite = (request.headers.get('Overwrite') ?? 'T') !== 'F';
+	let overwrite = parseOverwriteHeader(request);
+	if (overwrite === null) {
+		return new Response('Bad Request', { status: 400 });
+	}
 	let destination_header = request.headers.get('Destination');
 	if (destination_header === null) {
 		return new Response('Bad Request', { status: 400 });
@@ -1405,21 +1610,8 @@ async function handle_move(request: Request, bucket: R2Bucket): Promise<Response
 
 	if (destination_exists) {
 		// Delete the destination first
-		let deleteHeaders = new Headers();
-		for (const headerName of INTERNAL_DELETE_FORWARD_HEADERS) {
-			let headerValue = request.headers.get(headerName);
-			if (headerValue !== null) {
-				deleteHeaders.set(headerName, headerValue);
-			}
-		}
-		let deleteResponse = await handle_delete(
-			new Request(new URL(destination_header), {
-				method: 'DELETE',
-				headers: deleteHeaders,
-			}),
-			bucket,
-		);
-		if (!deleteResponse.ok) {
+		let deleteResponse = await deleteDestinationResource(request, bucket, destination_header);
+		if (deleteResponse !== null) {
 			return deleteResponse;
 		}
 	}
@@ -1589,10 +1781,12 @@ async function handle_lock(request: Request, bucket: R2Bucket): Promise<Response
 			status: existingLock ? 200 : 201,
 			headers: {
 				'Content-Type': 'application/xml; charset=utf-8',
-				'Lock-Token': `<urn:uuid:${lockDetails.token}>`,
+				Timeout: lockDetails.timeout,
+				// RFC 4918 §9.10.2: 刷新锁的响应不回 Lock-Token
 				...(existingLock
 					? {}
 					: {
+							'Lock-Token': `<urn:uuid:${lockDetails.token}>`,
 							Location: getResourceHref(resource.key, resource.customMetadata?.resourcetype === '<collection />'),
 						}),
 			},
